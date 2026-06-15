@@ -1,0 +1,9 @@
+__pycache__/
+*.egg-info/
+.vscode/
+.DS_Store
+
+# experiment outputs / results
+exp/
+evals_results/
+results/
