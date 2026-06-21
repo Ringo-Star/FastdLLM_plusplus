@@ -3,44 +3,47 @@
 > Training-free parallel decoding for diffusion LLMs that commits more tokens per denoising step by using the **full sorted confidence profile** — not just the weakest token.
 
 [![Paper](https://img.shields.io/badge/paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/2606.02955)
+[![Project Page](https://img.shields.io/badge/project-page-blue.svg)](https://ringo-star.github.io/projectpage_frechet/)
 
-Diffusion LLMs (dLLMs) can decode many tokens in parallel, but inference is bottlenecked by deciding *which* masked tokens can be committed together. [Fast-dLLM](https://arxiv.org/abs/2505.22618) solved this with KV caching and a confidence **factor** rule that accepts a candidate set of size *n* when `(n+1)(1 − c₍ₙ₎) < f`, where `c₍ₙ₎` is the **weakest** confidence among the top-*n* tokens. That rule assumes all selected tokens share the same confidence — conservative when, in practice, the confidence profile is highly heterogeneous.
+Diffusion LLMs (dLLMs) can decode many tokens in parallel, but inference is bottlenecked by deciding *which* masked tokens can be committed together. [Fast-dLLM](https://arxiv.org/abs/2505.22618) solved this with KV caching and a confidence **factor** rule that accepts a candidate set of size $n$ when $(n+1)(1 - c_{(n)}) < f$, where $c_{(n)}$ is the **weakest** confidence among the top-$n$ tokens. That rule assumes all selected tokens share the same confidence — conservative when, in practice, the confidence profile is highly heterogeneous.
 
-**Fast-dLLM++** replaces the weakest-token selector with **Fréchet profile decoding**, which uses the entire sorted profile `(c₍₁₎, …, c₍ₙ₎)`:
+**Fast-dLLM++** replaces the weakest-token selector with **Fréchet profile decoding**, which uses the entire sorted profile $(c_{(1)}, \ldots, c_{(n)})$:
 
-- **Fréchet lower bound** on joint correctness: `Lₙ = max(0, Σⱼ c₍ⱼ₎ − (n−1))`
-- **Competing-event upper bound:** `Uₙ = 1 − c₍ₙ₎`
-- **Fréchet score:** `Gₙ = Lₙ − Uₙ`
+- **Fréchet lower bound** on joint correctness: $L_n = \max\!\left(0,\,\sum_j c_{(j)} - (n-1)\right)$
+- **Competing-event upper bound:** $U_n = 1 - c_{(n)}$
+- **Fréchet score:** $G_n = L_n - U_n$
 
-Given a margin `δ ≥ 0`, it commits the largest prefix with `Gₙ > δ`.
+Given a margin $\delta \geq 0$, it commits the largest prefix with $G_n > \delta$.
 
-**Why it works.** If `Lₙ > Uₙ`, the parallel greedy commit provably matches the true joint greedy decision. In the equal-confidence case it reduces *exactly* to factor decoding under `f = 1 − δ`, so it is a strict generalization. The score decomposes into the factor core plus a non-negative *heterogeneity bonus* `Bₙ = Σⱼ<ₙ (c₍ⱼ₎ − c₍ₙ₎)` — the profile information the weakest-token rule discards — which is what lets it commit more tokens per step. The model, diffusion schedule, and cache are untouched: the only change is the token-selection rule (sorting + prefix sums over the active block, no extra parameters or memory), making it a true drop-in replacement.
+**Why it works.** If $L_n > U_n$, the parallel greedy commit provably matches the true joint greedy decision. In the equal-confidence case it reduces *exactly* to factor decoding under $f = 1 - \delta$, so it is a strict generalization. The score decomposes into the factor core plus a non-negative *heterogeneity bonus* $B_n = \sum_{j<n}(c_{(j)} - c_{(n)})$ — the profile information the weakest-token rule discards — which is what lets it commit more tokens per step. The model, diffusion schedule, and cache are untouched: the only change is the token-selection rule (sorting + prefix sums over the active block, no extra parameters or memory), making it a true drop-in replacement.
 
 ## Key results (Same-Hardware Comparisons)
 
-All comparisons use our own reproductions of threshold/factor on the same GPU.
+All comparisons use our own reproductions of threshold/factor on a single H100.
 
-### LLaDA-8B-Instruct, GSM8K 256, Prefix Cache (L40S)
+### LLaDA-8B-Instruct, GSM8K 256, Prefix Cache (H100)
 
 | Method | Accuracy | Tok/s | NFE |
 |--------|----------|-------|-----|
-| Threshold=0.9 | 78.47% | 53.6 | 107,053 |
-| Factor=1.0 | 78.32% | 67.9 | 79,387 |
-| **Fréchet d=0.30** | **78.54%** | **70.1** | **75,448** |
+| Threshold=0.9 | 77.6% | 73.8 | 107,135 |
+| Factor=0.75 | 78.1% | 96.0 | 79,047 |
+| **Fréchet d=0.25** | **77.2%** | **103.8** | **72,881** |
 
-### LLaDA-8B-Instruct, HumanEval 256, Prefix Cache (L40S)
+### LLaDA-8B-Instruct, HumanEval 256, Prefix Cache (H100)
 
 | Method | pass@1 | Tok/s | NFE |
 |--------|--------|-------|-----|
-| Threshold=0.9 | 40.24% | 70.3 | 13,930 |
-| **Fréchet d=0.25** | **40.85%** | **96.1** | **9,771** |
+| Threshold=0.9 | 40.2% | 77.8 | 13,666 |
+| Factor=0.75 | 40.7% | 89.6 | 10,538 |
+| **Fréchet d=0.25** | **40.9%** | **107.7** | **9,740** |
 
-### LLaDA-8B-Instruct, GSM8K 1024, Dual Cache (A100)
+### LLaDA-8B-Instruct, GSM8K 1024, Dual Cache (H100)
 
 | Method | Accuracy | Tok/s | NFE |
 |--------|----------|-------|-----|
-| Factor=1.0 | 74.45% | 21.6 | 118,581 |
-| **Fréchet d=0.02** | **74.98%** | **22.7** | **101,002** |
+| Threshold=0.9 | 77.3% | 34.6 | 33,308 |
+| Factor=0.75 | 76.7% | 39.8 | 26,609 |
+| **Fréchet d=0.25** | **78.0%** | **40.8** | **25,172** |
 
 ## Installation
 
@@ -94,7 +97,7 @@ See [LLaDA-V/README.md](LLaDA-V/README.md) for environment setup and the MathVis
 
 ## Choosing the margin δ
 
-Smaller `δ` commits more tokens per step (faster, riskier); larger `δ` is more conservative. `δ = 0.25` is the global default used in the main tables (`f = 1 − δ` maps to Fast-dLLM's factor).
+Smaller $\delta$ commits more tokens per step (faster, riskier); larger $\delta$ is more conservative. $\delta = 0.25$ is the global default used in the main tables ($f = 1 - \delta$ maps to Fast-dLLM's factor).
 
 | Task | Recommended δ | Notes
 |---|---|---|
