@@ -1,0 +1,163 @@
+diff --git a/dllm b/dllm
+index 75e1885..0306f52 160000
+--- a/dllm
++++ b/dllm
+@@ -1 +1 @@
+-Subproject commit 75e188539cb44053bf77d438d3b2f911f5491cca
++Subproject commit 0306f52bb9edb4d97a5887463ae041b09ec69f76-dirty
+diff --git a/scripts/eval.py b/scripts/eval.py
+index 3486c45..59f050f 100644
+--- a/scripts/eval.py
++++ b/scripts/eval.py
+@@ -114,28 +114,37 @@ def generate_with_algorithm(
+             
+             # Import appropriate sampler based on model type
+             if 'dream' in adapter_class_name:
+-                from dllm.pipelines.info_gain.dream import InfoGainDreamSampler, InfoGainDreamSamplerConfig
++                from dllm.pipelines.infogain.dream import InfoGainDreamSampler, InfoGainDreamSamplerConfig
+                 SamplerClass = InfoGainDreamSampler
+                 ConfigClass = InfoGainDreamSamplerConfig
+             elif 'llada' in adapter_class_name:
+-                from dllm.pipelines.info_gain.llada import InfoGainLLaDASampler, InfoGainLLaDASamplerConfig
++                from dllm.pipelines.infogain.llada import InfoGainLLaDASampler, InfoGainLLaDASamplerConfig
+                 SamplerClass = InfoGainLLaDASampler
+                 ConfigClass = InfoGainLLaDASamplerConfig
+             elif 'sdar' in adapter_class_name:
+-                from dllm.pipelines.info_gain.sdar import InfoGainSDARSampler, InfoGainSDARSamplerConfig
++                from dllm.pipelines.infogain.sdar import InfoGainSDARSampler, InfoGainSDARSamplerConfig
+                 SamplerClass = InfoGainSDARSampler
+                 ConfigClass = InfoGainSDARSamplerConfig
+             else:
+                 # Default to LLaDA sampler
+-                from dllm.pipelines.info_gain.llada import InfoGainLLaDASampler, InfoGainLLaDASamplerConfig
++                from dllm.pipelines.infogain.llada import InfoGainLLaDASampler, InfoGainLLaDASamplerConfig
+                 SamplerClass = InfoGainLLaDASampler
+                 ConfigClass = InfoGainLLaDASamplerConfig
+             
+             # Create sampler instance
+             sampler = SamplerClass(model=model_adapter.model, tokenizer=model_adapter.tokenizer)
++            # FRECHET_INSERTION_PATCH: LLaDA tokenizer has no mask_token_id; use adapter-detected id
++            if getattr(model_adapter.tokenizer, "mask_token_id", None) is None:
++                model_adapter.tokenizer.mask_token_id = model_adapter.mask_id
+             
++            # FRECHET_INSERTION_PATCH: forward frechet_margin only when set
++            _extra_cfg = {}
++            _fm = kwargs.get('frechet_margin', None)
++            if _fm is not None:
++                _extra_cfg['frechet_margin'] = float(_fm)
+             # Create config
+             config = ConfigClass(
++                **_extra_cfg,
+                 max_new_tokens=gen_length,
+                 block_size=block_length,
+                 steps=steps,
+@@ -452,6 +461,29 @@ def main(args=None):
+     # Load model
+     print(f"Loading model: {args.model_name}")
+     adapter = get_model_adapter(args.model_name, device=args.device)
++
++    # --- FRECHET_INSERTION_PATCH: compute-accounting instrumentation ---
++    # Info-Gain does batched candidate lookahead: raw call counts are NOT
++    # compute-comparable to single-forward methods. We record:
++    #   model_calls      = number of model forward invocations (native NFE analog)
++    #   row_forwards     = sum over calls of input batch rows (effective forward
++    #                      work; a call with an 8-candidate batch counts 8)
++    #   row_token_forwards = sum over calls of rows*seq_len (token-level work)
++    # plus wall time per sample. Primary ranking axis = wall time / row_forwards.
++    import time as _time
++    import json as _json
++    _COUNT = {"model_calls": 0, "row_forwards": 0, "row_token_forwards": 0}
++    _orig_forward = adapter.model.forward
++    def _counting_forward(*_a, **_kw):
++        _ids = _kw.get("input_ids", _a[0] if _a else None)
++        if _ids is not None and hasattr(_ids, "shape") and _ids.dim() == 2:
++            _COUNT["model_calls"] += 1
++            _COUNT["row_forwards"] += int(_ids.shape[0])
++            _COUNT["row_token_forwards"] += int(_ids.shape[0]) * int(_ids.shape[1])
++        return _orig_forward(*_a, **_kw)
++    adapter.model.forward = _counting_forward
++    _PER_SAMPLE = []
++    # --- end instrumentation setup ---
+     
+     # Set baseline path if not provided
+     if not hasattr(args, 'baseline_name') or args.baseline_name is None:
+@@ -656,6 +688,7 @@ def main(args=None):
+                 'baseline_name': getattr(args, 'baseline_name', None),
+                 'dynamic_threshold': getattr(args, 'threshold', 0.8),
+                 'variant': getattr(args, 'variant', 'info_gain'),
++                'frechet_margin': getattr(args, 'frechet_margin', None),  # FRECHET_INSERTION_PATCH
+             })
+             if hasattr(args, 'tokens_per_step') and args.tokens_per_step is not None:
+                 gen_kwargs['tokens_per_step'] = args.tokens_per_step
+@@ -681,11 +714,52 @@ def main(args=None):
+         if not hasattr(args, 'baseline_name') or args.baseline_name is None:
+             args.baseline_name = gen_kwargs.get('baseline_name', None)
+         
+-        # Generate
++        # Generate  (FRECHET_INSERTION_PATCH: timed + counted)
++        _snap0 = dict(_COUNT)
++        _t0 = _time.perf_counter()
+         with torch.no_grad():
+             output_ids = generate_with_algorithm(
+                 adapter, prompt_ids, args.algorithm, **gen_kwargs
+             )
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        _dt = _time.perf_counter() - _t0
++        _PER_SAMPLE.append({
++            "idx": idx,
++            "wall_s": round(_dt, 4),
++            "model_calls": _COUNT["model_calls"] - _snap0["model_calls"],
++            "row_forwards": _COUNT["row_forwards"] - _snap0["row_forwards"],
++            "row_token_forwards": _COUNT["row_token_forwards"] - _snap0["row_token_forwards"],
++            "prompt_len": int(prompt_ids.shape[1]),
++            "gen_length": int(gen_kwargs.get("gen_length", 0)),
++        })
++        if (idx + 1) % 10 == 0 or (idx + 1) == len(dataset):
++            _tot_w = sum(s["wall_s"] for s in _PER_SAMPLE)
++            _met = {
++                "config": {k: v for k, v in vars(args).items()
++                           if isinstance(v, (int, float, str, bool, type(None)))},
++                "n_samples_done": len(_PER_SAMPLE),
++                "totals": {
++                    "wall_s": round(_tot_w, 2),
++                    "model_calls": sum(s["model_calls"] for s in _PER_SAMPLE),
++                    "row_forwards": sum(s["row_forwards"] for s in _PER_SAMPLE),
++                    "row_token_forwards": sum(s["row_token_forwards"] for s in _PER_SAMPLE),
++                    "gen_tokens_canvas": sum(s["gen_length"] for s in _PER_SAMPLE),
++                    "canvas_tok_per_s": round(sum(s["gen_length"] for s in _PER_SAMPLE) / max(_tot_w, 1e-9), 3),
++                },
++                "definitions": {
++                    "model_calls": "model forward invocations (native NFE analog for this repo; no native NFE counter exists in the info-gain path)",
++                    "row_forwards": "sum of input batch rows over all forward calls = effective forward work (candidate lookahead batches counted at full width)",
++                    "row_token_forwards": "sum of rows*seq_len over all forward calls",
++                    "canvas_tok_per_s": "gen_length canvas tokens / total wall seconds (repo has no native tok/s convention)",
++                },
++                "per_sample": _PER_SAMPLE,
++            }
++            try:
++                with open(str(args.result_path) + ".metrics.json", "w") as _mf:
++                    _json.dump(_met, _mf, indent=1)
++            except Exception as _e:
++                print(f"[metrics] write failed: {_e}")
+         
+         # Extract generated text based on task type
+         if args.task == 'sudoku' and getattr(args, 'gen_length', 512) == 0:
+diff --git a/src/compat.py b/src/compat.py
+index daf502f..17b7b43 100644
+--- a/src/compat.py
++++ b/src/compat.py
+@@ -23,9 +23,12 @@ def _patch_torchvision():
+     try:
+         import torchvision  # noqa: F401
+         return  # Already works, nothing to do
+-    except (RuntimeError, AttributeError):
++    except (RuntimeError, AttributeError, ImportError):  # FRECHET_INSERTION_PATCH: tolerate missing torchvision
+         pass
+ 
++    if "torchvision" not in sys.modules and not any(k.startswith("torchvision.") for k in sys.modules):
++        return  # FRECHET_INSERTION_PATCH: torchvision not installed at all; nothing to patch
++
+     # Clean up the partially initialized torchvision from sys.modules
+     _torchvision_keys = [k for k in sys.modules if k == 'torchvision' or k.startswith('torchvision.')]
+     for key in _torchvision_keys:

@@ -1,0 +1,6 @@
+# Source snapshots for adaptive-selector-baselines (2026-07-25)
+KLASS   repo=https://github.com/shkim0116/KLASS      commit=ad87ecbe9fdef4a6e93701afbc150cb9213fbcd7
+APD     repo=https://github.com/danielmisrael/apd    commit=a0255da4ebc238d77e936bf85c315160484ff4cd
+backbone= GSAI-ML/LLaDA-8B-Instruct (cached on ec2_p5_west ~/.cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct)
+env= ec2_p5_west ~/envs/fast-dllm-eval (transformers 4.49.0, torch 2.5.1+cu121)
+NOTE: unofficial APD reimpl csutora/adaptive-parallel-decoding NOT used.

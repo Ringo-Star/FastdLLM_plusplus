@@ -1,0 +1,91 @@
+diff --git a/dllm/pipelines/infogain/llada/sampler.py b/dllm/pipelines/infogain/llada/sampler.py
+index 4ff3dcb..39ed79d 100644
+--- a/dllm/pipelines/infogain/llada/sampler.py
++++ b/dllm/pipelines/infogain/llada/sampler.py
+@@ -24,6 +24,49 @@ from dllm.pipelines.fastdllm.llada.sampler import (
+ from dllm.pipelines.infogain import info_gain_ops as ig
+ 
+ 
++
++
++# --- FRECHET_INSERTION_PATCH: profile-aware Frechet commit-set selection ---
++# Ported from ~/anchors/generate.py::get_transfer_index_frechet_profile
++# (Fast-dLLM++ Frechet certificate). For sorted selected confidences
++# c_(1) >= ... >= c_(n): L_n = sum_j c_(j) - (n-1); U_n = 1 - c_(n);
++# decode the largest n with L_n - U_n > margin. Always commits >= 1 token.
++# temperature=0 greedy path only (Gumbel noise is a no-op at temp 0).
++def _frechet_select(logits_row: torch.Tensor, x_row: torch.Tensor,
++                    block_mask: torch.Tensor, margin: float):
++    """logits_row [1,T,V]; x_row [1,T]; block_mask [1,T] bool (masked positions
++    of the CURRENT block only). Returns (x0, transfer_index [1,T] bool)."""
++    p = F.softmax(logits_row.to(torch.float64), dim=-1)
++    x0 = torch.argmax(logits_row, dim=-1)
++    x0 = torch.where(block_mask, x0, x_row)
++    conf = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)
++    neg_inf = torch.finfo(conf.dtype).min
++    conf = torch.where(block_mask, conf, torch.full_like(conf, neg_inf))
++
++    B, L = conf.shape
++    values, idx = torch.sort(conf, dim=1, descending=True)
++    counts = block_mask.sum(dim=1)
++    cols = torch.arange(L, device=conf.device).unsqueeze(0).expand(B, L)
++    valid = cols < counts.unsqueeze(1)
++
++    sorted_conf = torch.where(valid, values, torch.zeros_like(values))
++    cum = torch.cumsum(sorted_conf, dim=1)
++    frechet_lb = cum - cols.to(cum.dtype)
++    competitor_ub = 1.0 - values
++    score = frechet_lb - competitor_ub
++    score = torch.where(valid, score, torch.full_like(score, float("-inf")))
++    score[:, 0] = float("inf")  # always transfer at least one token
++
++    choose = score > margin
++    topn = choose.sum(dim=1).clamp(min=1)
++    select_sorted = cols < topn.unsqueeze(1)
++    transfer = torch.zeros(B, L, dtype=torch.bool, device=conf.device)
++    transfer = transfer.scatter(1, idx, select_sorted)
++    transfer = transfer & block_mask
++    return x0, transfer
++# --- end FRECHET_INSERTION_PATCH helper ---
++
++
+ @dataclass
+ class InfoGainLLaDASamplerConfig(FastdLLMLLaDASamplerConfig):
+     """Info-Gain fields (used when ``use_cache`` is ``None``)."""
+@@ -34,6 +77,7 @@ class InfoGainLLaDASamplerConfig(FastdLLMLLaDASamplerConfig):
+     info_gain_cost_reduction: str = "sum"  # "sum" | "mean" ("entropy*")
+     info_gain_cost_weight: float = 1.0
+     info_gain_future_weight: float = 1.0
++    frechet_margin: Optional[float] = None  # FRECHET_INSERTION_PATCH
+ 
+ 
+ class InfoGainLLaDASampler(FastdLLMLLaDASampler):
+@@ -87,6 +131,9 @@ class InfoGainLLaDASampler(FastdLLMLLaDASampler):
+         info_gain_future_weight = float(
+             kwargs.get("info_gain_future_weight", config.info_gain_future_weight)
+         )
++        frechet_margin = kwargs.get(  # FRECHET_INSERTION_PATCH
++            "frechet_margin", getattr(config, "frechet_margin", None)
++        )
+ 
+         steps = int(steps)
+         if steps < 1:
+@@ -234,6 +281,18 @@ class InfoGainLLaDASampler(FastdLLMLLaDASampler):
+                         changed = True
+                         continue
+ 
++                    # FRECHET_INSERTION_PATCH: replace Info-Gain candidate
++                    # lookahead selection with the Frechet certificate commit set.
++                    if frechet_margin is not None:
++                        x0f, tri = _frechet_select(lx, xx, ma, float(frechet_margin))
++                        if tri.any():
++                            x_row = x[row].clone()
++                            sel = tri[0]
++                            x_row[sel] = x0f[0][sel]
++                            x[row] = x_row
++                            changed = True
++                        continue
++
+                     k = 1
+                     result = ig.generate_candidates(
+                         lx,

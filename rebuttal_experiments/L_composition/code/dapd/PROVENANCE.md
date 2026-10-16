@@ -1,0 +1,11 @@
+# DAPD Frechet insertion (pipeline 2) provenance
+- Date: 2026-08-02, box: ec2_p5 (ip-172-31-7-19), GPU: CUDA_VISIBLE_DEVICES=2 ONLY, one run at a time.
+- Repo: ~/baselines/DAPD @ git 05727b08da4cb4008a275123d7d9885dd5714f7c (+ working-tree patch frechet_insertion.patch)
+- Env: ~/miniforge3/envs/dapd. Model: LLaDA-8B-Instruct snapshot 08b83a6f (local HF cache).
+- Files modified: dapd/core.py (VALID_DAPD_ALGORITHMS += frechet), dapd/generation.py (_compute_frechet_selection verbatim port of anchors/generate.py get_transfer_index_frechet_profile incl. float64 softmax confidence; frechet branch replaces direct+independent-set commit decision in generate_dapd; block path guarded), evaluation/lm-evaluation-harness/lm_eval/models/llada_dapd.py (frechet_margin plumbing).
+- Attention capture decision: KEPT ACTIVE. Rationale: (1) per-step compute parity with the unmodified dapd_direct baseline row so tok/s isolates the commit-rule effect; (2) less invasive (decode loop untouched except the selection branch). Frechet selector does not consume the captured attention.
+- Command per run: lm_eval --model llada-dapd --model_args pretrained=<snap>,alg=frechet,frechet_margin=<delta>,tau_min=0.005,tau_max=0.05,layer_ratio=0.3,max_gen_toks=256,block_length=0 --tasks gsm8k --batch_size 1 --limit <8|300> (see run_ins_dapd.sh)
+- Step/NFE counter: DAPD own avg_steps (total_steps per sample, 1 forward pass per step): same counter as baseline row.
+- Baseline (unmodified, matrix rep1 20260801T214718Z): acc .73 flex, steps 35.19, tok/s 99.78, wall 785s.
+- Gate: modified-code dapd_direct limit-8 reproduces unmodified warmup8 EXACTLY (acc .75, steps 42.1). frechet limit-8 d=.25 acc .375, coherent but truncated outputs.
+- Finding: on DAPD global 256-token canvas (no blocks), Frechet mass-commits the confident EOS tail early (e.g. 91 tokens at step 2), truncating answers; DAPD direct rule only commits bf16-saturated c~1.0 so it avoids this. Accuracy falls and steps RISE with delta (fewer commits/step but shorter valid outputs).

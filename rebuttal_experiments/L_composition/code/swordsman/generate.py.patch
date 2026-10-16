@@ -1,0 +1,110 @@
+--- generate.py.orig_frechet	2026-08-02 20:12:57.174605104 +0000
++++ generate.py	2026-08-02 20:14:38.881300263 +0000
+@@ -430,7 +430,7 @@
+     metric='entropy',topk_entropy_k=10,
+     temperature=0., remasking='low_confidence', mask_id=126336,
+     dynamic_threshold_method=None, base_threshold=0.9, min_threshold=0.7,confidence_boost=1.0,
+-    threshold=None, factor=None, prompt_id="0"
++    threshold=None, factor=None, frechet_margin=None, prompt_id="0"
+ ):
+     
+     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+@@ -500,7 +500,10 @@
+                 )
+             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+             x0 = torch.argmax(logits_with_noise, dim=-1) 
+-            if factor is None:
++            if frechet_margin is not None:
++                x0, transfer_index = get_transfer_index_frechet_profile(logits, temperature, remasking, mask_index,
++                                                                x[:, current_idx:], margin=frechet_margin)
++            elif factor is None:
+                 x0, transfer_index = get_transfer_index_origin(logits, temperature, remasking, mask_index, 
+                                                                 x[:, current_idx:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+             else:
+@@ -510,7 +513,7 @@
+             i += 1
+             if (x[:, current_idx:block_end] == mask_id).sum() == 0:
+                 break
+-            if i >= current_steps and threshold is None:
++            if i >= current_steps and threshold is None and frechet_margin is None:
+                 break
+         current_idx = block_end
+     return x, nfe
+@@ -1041,4 +1044,75 @@
+         nvtx.range_pop()
+ 
+ if __name__ == '__main__':
+-    main()
+\ No newline at end of file
++    main()
++
++# ==== Fréchet-profile commit rule (ported VERBATIM from $ROOT/anchors/generate.py L177-245) ====
++def get_transfer_index_frechet_profile(
++    logits: torch.Tensor,
++    temperature: float,
++    remasking: str,
++    mask_index: torch.Tensor,
++    x: torch.Tensor,
++    margin: float = 0.0,
++):
++    """
++    Profile-aware Fréchet decoding.
++
++    For sorted selected confidences c_(1) >= ... >= c_(n), define
++        L_n = sum_{j=1}^n c_(j) - (n - 1)
++        U_n = 1 - c_(n)
++        score_n = L_n - U_n
++    Decode the largest n with score_n > margin.
++
++    When all confidences equal 1-eps, this reduces to the paper's factor
++    condition (n+1)*eps < 1, so this is a strict generalization.
++
++    Returns:
++        x0: (B, L) long
++        transfer_index: (B, L) bool
++    """
++    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
++    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L)
++
++    if remasking == "low_confidence":
++        p = F.softmax(logits.to(torch.float64), dim=-1)
++        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
++    elif remasking == "random":
++        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)
++    else:
++        raise NotImplementedError(remasking)
++
++    x0 = torch.where(mask_index, x0, x)
++
++    neg_inf = torch.tensor(torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype)
++    confidence = torch.where(mask_index, x0_p, neg_inf)  # (B, L)
++
++    B, L = confidence.shape
++    values, idx = torch.sort(confidence, dim=1, descending=True)
++
++    counts = mask_index.sum(dim=1)  # (B,)
++    cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)
++    valid = cols < counts.unsqueeze(1)
++
++    sorted_conf = torch.where(valid, values, torch.zeros_like(values))
++    cum = torch.cumsum(sorted_conf, dim=1)
++
++    # n is 1-indexed: L_n = cum_n - (n-1) = cum - cols  (cols is 0-indexed)
++    frechet_lb = cum - cols.to(cum.dtype)
++    competitor_ub = 1.0 - values
++    score = frechet_lb - competitor_ub
++
++    score = torch.where(valid, score, torch.full_like(score, -torch.inf))
++
++    # always transfer at least one token whenever masked tokens exist
++    score[:, 0] = torch.inf
++
++    choose = score > margin
++    topn = choose.sum(dim=1).clamp(min=1)
++
++    select_sorted = cols < topn.unsqueeze(1)
++    transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8)
++    transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
++    transfer_index = transfer_int.bool() & mask_index
++
++    return x0, transfer_index

@@ -1,0 +1,155 @@
+diff --git a/llada/eval_llada.py b/llada/eval_llada.py
+index 064ac30..f7ad3a4 100644
+--- a/llada/eval_llada.py
++++ b/llada/eval_llada.py
+@@ -48,6 +48,7 @@ class LLaDAEvalHarness(LM):
+         commit_thres=0.70,
+         draft_thres=0.98,
+         max_window_size=128,
++        frechet_margin=None,
+         device="cuda",
+         method="original",         
+         **kwargs,
+@@ -117,6 +118,7 @@ class LLaDAEvalHarness(LM):
+         self.commit_thres = commit_thres
+         self.draft_thres = draft_thres
+         self.max_window_size = max_window_size
++        self.frechet_margin = float(frechet_margin) if frechet_margin is not None else None
+         #self.num_distal_blocks = num_distal_blocks
+         self.is_instruct = True if 'instruct' in model_path.lower() else False
+         
+@@ -294,7 +296,7 @@ class LLaDAEvalHarness(LM):
+                 generated_answer = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, temperature=0., cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
+             
+             elif self.method == "dc_leap":
+-                generated_answer = generate_with_dc_leap(self.model, input_ids, steps=self.steps, commit_thres=self.commit_thres, draft_thres=self.draft_thres, gen_length=self.gen_length, block_length=self.block_length, max_window_size=self.max_window_size, temperature=0., cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
++                generated_answer = generate_with_dc_leap(self.model, input_ids, steps=self.steps, commit_thres=self.commit_thres, draft_thres=self.draft_thres, gen_length=self.gen_length, block_length=self.block_length, max_window_size=self.max_window_size, temperature=0., cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id, frechet_margin=self.frechet_margin)
+             else:
+                 raise ValueError(f"Unknown method: {self.method}")
+                 
+@@ -318,6 +320,8 @@ class LLaDAEvalHarness(LM):
+         print(f"[Local] Number of tokens: {total_raw_tokens}")
+         print(f"[Local] Generation time: {elapsed:.2f} seconds")
+         print(f"[Local] Tokens per second: {total_raw_tokens / elapsed:.2f}")
++        from generate import NFE_COUNTER
++        print(f"[Local] Total NFE: {NFE_COUNTER['count']} ")
+ 
+         accelerator = getattr(self, 'accelerator', None)
+         if accelerator is not None and accelerator.num_processes > 1:
+diff --git a/llada/generate.py b/llada/generate.py
+index 5605b5e..b3c8dd9 100644
+--- a/llada/generate.py
++++ b/llada/generate.py
+@@ -134,6 +134,75 @@ def verify_and_commit(
+     
+     return top1_indices, final_commit_mask
+ 
++
++def verify_and_commit_frechet(
++    region_logits: torch.Tensor,
++    region_x: torch.Tensor,
++    mask_id: int,
++    frechet_margin: float,
++    left_boundary_known: bool
++):
++    """
++    Frechet-certificate replacement for DC-Leap's per-token commit threshold
++    (INSERTION experiment). Ported VERBATIM from
++    ~/anchors/generate.py::get_transfer_index_frechet_profile:
++
++        For selected confidences c_(1) >= ... >= c_(n):
++            L_n   = sum_{j=1}^n c_(j) - (n - 1)     (frechet_lb)
++            U_n   = 1 - c_(n)                        (competitor_ub)
++            score = L_n - U_n
++        Commit the largest n with score_n > frechet_margin.
++
++    The ONLY difference vs the anchor reference: the candidate set is DC-Leap's
++    contiguous masked prefix of the decoding window (position order), preserving
++    DC-Leap's Dynamic Contiguous Verification workflow. Within a positional
++    prefix, c_(n) = running min of the prefix, so the same L_n/U_n formulas
++    apply set-wise (the certificate holds for ANY proposed commit set).
++    Equal-confidence case reduces to Factor f = 1 - delta, as in the reference.
++    Everything else (drafting, window scheduling, fallback) is unchanged.
++    """
++    top1_indices, top1_probs = get_top1_info(region_logits)
++
++    is_mask = (region_x == mask_id)
++
++    if not left_boundary_known:
++        final_commit_mask = torch.zeros_like(is_mask, dtype=torch.bool)
++        return top1_indices, final_commit_mask
++
++    # confidences in float64, as in the reference implementation
++    c = top1_probs.to(torch.float64)
++    L = c.shape[0]
++    cols = torch.arange(L, device=c.device, dtype=torch.float64)  # 0-indexed (n-1)
++
++    # candidate prefix must stay within the contiguous masked prefix
++    valid = torch.cumprod(is_mask.int(), dim=0).bool()
++
++    cum = torch.cumsum(torch.where(valid, c, torch.zeros_like(c)), dim=0)
++    run_min = torch.cummin(torch.where(valid, c, torch.ones_like(c)), dim=0).values
++
++    # n is 1-indexed: L_n = cum_n - (n-1) = cum - cols (cols is 0-indexed)
++    frechet_lb = cum - cols
++    competitor_ub = 1.0 - run_min
++    score = frechet_lb - competitor_ub
++
++    score = torch.where(valid, score, torch.full_like(score, -torch.inf))
++
++    choose = score > frechet_margin
++    topn = int(choose.sum().item())
++
++    final_commit_mask = torch.zeros_like(is_mask, dtype=torch.bool)
++    if topn > 0:
++        final_commit_mask[:topn] = True
++    final_commit_mask = final_commit_mask & is_mask
++
++    return top1_indices, final_commit_mask
++
++# Instrumentation only (INSERTION experiment): counts model forward passes
++# (1 per decoding-window iteration; x2 when cfg_scale>0 doubles the batch).
++# Does not alter generation behavior.
++NFE_COUNTER = {"count": 0}
++
++
+ @torch.no_grad()
+ def generate_with_dc_leap(
+     model: "LLaDAModelLM",
+@@ -148,6 +217,7 @@ def generate_with_dc_leap(
+     temperature: float,
+     remasking='low_confidence', 
+     mask_id: int = 126336,
++    frechet_margin: float = None,
+      
+ ) -> torch.Tensor:
+     '''
+@@ -205,6 +275,7 @@ def generate_with_dc_leap(
+         else:
+             pred_model_out = model(x_for_prediction, output_hidden_states=False)
+             prediction_logits = pred_model_out.logits
++        NFE_COUNTER["count"] += 1
+ 
+         l2r_abs_end = min(prompt_len + verified_end + l2r_len, abs_win_e)
+         
+@@ -216,10 +287,16 @@ def generate_with_dc_leap(
+             if verified_end > 0:
+                 left_boundary_known = (x[0, abs_win_s - 1].item() != mask_id)
+             
+-            top1_tokens, commit_mask = verify_and_commit(
+-                region_logits, region_x, mask_id, 
+-                commit_thres, left_boundary_known
+-            )
++            if frechet_margin is not None:
++                top1_tokens, commit_mask = verify_and_commit_frechet(
++                    region_logits, region_x, mask_id,
++                    frechet_margin, left_boundary_known
++                )
++            else:
++                top1_tokens, commit_mask = verify_and_commit(
++                    region_logits, region_x, mask_id, 
++                    commit_thres, left_boundary_known
++                )
+ 
+             if not commit_mask.any():
+                 is_mask = (region_x == mask_id)
