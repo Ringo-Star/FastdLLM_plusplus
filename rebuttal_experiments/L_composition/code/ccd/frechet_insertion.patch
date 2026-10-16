@@ -1,0 +1,54 @@
+diff --git a/model.py b/model.py
+index 3176eab..2722e53 100644
+--- a/model.py
++++ b/model.py
+@@ -417,6 +417,11 @@ class ExtendedDreamModel(DreamModel):
+ 
+         verification_buffer = {"token_index": [], "token_id": [], "prediction": []}
+         draft_buffer = {"token_index": [], "token_id": [], "prediction": []}
++        # === FRECHET INSERTION: read delta from env (unset => original CCD behavior) ===
++        import os as _os
++        _fd = _os.environ.get("CCD_FRECHET_DELTA", "")
++        _FRECHET_DELTA = float(_fd) if _fd else None
++        # === END FRECHET INSERTION ===
+         uniform_onestep_number_transfer_tokens = int((max_length - input_ids.shape[1]) / steps)
+         expand_ratio = expand_ratio
+         verification_buffer_size_maximum = uniform_onestep_number_transfer_tokens + int(
+@@ -547,6 +552,37 @@ class ExtendedDreamModel(DreamModel):
+                             # transfer_index shape 1xtopk
+                             _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+ 
++                            # === FRECHET INSERTION (G_n rule, verbatim port of
++                            # anchors/generate.py::get_transfer_index_frechet_profile):
++                            # sorted desc confidences c_(1)>=...>=c_(n);
++                            # L_n = cumsum - (n-1); U_n = 1 - c_(n); score = L_n - U_n;
++                            # score[:,0] = inf; commit largest prefix with score > delta.
++                            # Confidence measure = softmax probability of the candidate
++                            # token (as in the anchor), replacing the fixed-count topk
++                            # commit over neg-entropy confidence. ===
++                            if _FRECHET_DELTA is not None:
++                                _p = torch.softmax(mask_logits.to(torch.float64), dim=-1)
++                                _x0_p = torch.gather(_p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
++                                _full_prob = torch.full(x.shape, float("-inf"), device=self.device, dtype=torch.float64)
++                                _full_prob[mask_index] = _x0_p
++                                _B, _L = _full_prob.shape
++                                _values, _idx = torch.sort(_full_prob, dim=1, descending=True)
++                                _counts = mask_index.sum(dim=1)
++                                _cols = torch.arange(_L, device=_full_prob.device).unsqueeze(0).expand(_B, _L)
++                                _valid = _cols < _counts.unsqueeze(1)
++                                _sorted_conf = torch.where(_valid, _values, torch.zeros_like(_values))
++                                _cum = torch.cumsum(_sorted_conf, dim=1)
++                                _frechet_lb = _cum - _cols.to(_cum.dtype)
++                                _competitor_ub = 1.0 - _values
++                                _score = _frechet_lb - _competitor_ub
++                                _score = torch.where(_valid, _score, torch.full_like(_score, float("-inf")))
++                                _score[:, 0] = float("inf")
++                                _choose = _score > _FRECHET_DELTA
++                                _topn = int(_choose.sum(dim=1).clamp(min=1).item())  # repo is batch=1
++                                number_transfer_tokens = _topn
++                                transfer_index = _idx[:, :_topn]
++                            # === END FRECHET INSERTION ===
++
+ 
+                     else:
+                         full_confidence = full_confidence / alg_temp

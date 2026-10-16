@@ -1,0 +1,8 @@
+commit e105d455c120749c0baa91bca0c3994c2c708ebc
+Author: Yanhua Jiao <3302930156@qq.com>
+Date:   Thu Jul 30 08:44:27 2026 +0800
+
+    Delete DC-Leap.pdf
+ llada/eval_llada.py |  6 +++-
+ llada/generate.py   | 85 ++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 86 insertions(+), 5 deletions(-)

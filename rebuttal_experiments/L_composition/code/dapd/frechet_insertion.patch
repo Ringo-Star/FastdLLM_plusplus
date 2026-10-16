@@ -1,0 +1,203 @@
+diff --git a/dapd/core.py b/dapd/core.py
+index 83abc89..c1250b7 100644
+--- a/dapd/core.py
++++ b/dapd/core.py
+@@ -4,7 +4,7 @@ import torch
+ import torch.nn.functional as F
+ from typing import List, Tuple, Optional, Dict, Any, Union
+ 
+-VALID_DAPD_ALGORITHMS = ("dapd_staged", "dapd_direct")
++VALID_DAPD_ALGORITHMS = ("dapd_staged", "dapd_direct", "frechet")
+ 
+ 
+ def validate_dapd_algorithm(alg: Optional[str]) -> str:
+diff --git a/dapd/generation.py b/dapd/generation.py
+index 2c65893..244e972 100644
+--- a/dapd/generation.py
++++ b/dapd/generation.py
+@@ -87,6 +87,60 @@ def _init_dapd_algorithm_stats(stats: dict, alg: str) -> None:
+         stats["staged_conf_unmasked_per_step"] = []
+     elif alg == "dapd_direct":
+         stats["direct_conf_unmasked_per_step"] = []
++    elif alg == "frechet":
++        stats["frechet_committed_per_step"] = []
++
++
++def _compute_frechet_selection(
++    *,
++    confidence: torch.Tensor,
++    mask_index: torch.Tensor,
++    margin: float,
++) -> torch.Tensor:
++    """Frechet-profile commit rule (INSERTION experiment).
++
++    Ported VERBATIM from the anchor ``get_transfer_index_frechet_profile``
++    (Fast-dLLM/v1/llada/generate.py): for sorted masked-candidate
++    confidences c_(1) >= ... >= c_(n),
++        L_n = sum_{j<=n} c_(j) - (n - 1)
++        U_n = 1 - c_(n)
++        score_n = L_n - U_n
++    commit the largest set with score_n > margin (always >= 1 token when
++    masks remain). Operates on the SAME per-step marginal confidences that
++    DAPD's own selector consumes; equal-confidence case reduces to Factor
++    f = 1 - margin.
++    """
++    conf = confidence.to(torch.float64)
++    neg_inf = torch.tensor(torch.finfo(conf.dtype).min, device=conf.device, dtype=conf.dtype)
++    conf = torch.where(mask_index, conf, neg_inf)
++
++    B, L = conf.shape
++    values, idx = torch.sort(conf, dim=1, descending=True)
++
++    counts = mask_index.sum(dim=1)  # (B,)
++    cols = torch.arange(L, device=conf.device).unsqueeze(0).expand(B, L)
++    valid = cols < counts.unsqueeze(1)
++
++    sorted_conf = torch.where(valid, values, torch.zeros_like(values))
++    cum = torch.cumsum(sorted_conf, dim=1)
++
++    # n is 1-indexed: L_n = cum_n - (n-1) = cum - cols  (cols is 0-indexed)
++    frechet_lb = cum - cols.to(cum.dtype)
++    competitor_ub = 1.0 - values
++    score = frechet_lb - competitor_ub
++
++    score = torch.where(valid, score, torch.full_like(score, -torch.inf))
++
++    # always transfer at least one token whenever masked tokens exist
++    score[:, 0] = torch.inf
++
++    choose = score > margin
++    topn = choose.sum(dim=1).clamp(min=1)
++
++    select_sorted = cols < topn.unsqueeze(1)
++    transfer_int = torch.zeros(B, L, device=conf.device, dtype=torch.int8)
++    transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
++    return transfer_int.bool() & mask_index
+ 
+ 
+ def _compute_dapd_direct_selection(
+@@ -125,6 +179,7 @@ def generate_dapd(
+     verbose=False,
+     alg="dapd_staged",
+     collect_step_history=True,
++    frechet_margin=None,
+     **removed_options,
+ ):
+     """Generate with the paper DAPD algorithm."""
+@@ -132,6 +187,8 @@ def generate_dapd(
+         raise ValueError(f"Unsupported DAPD options in deploy path: {sorted(removed_options)}")
+ 
+     alg = validate_dapd_algorithm(alg)
++    if alg == "frechet" and frechet_margin is None:
++        raise ValueError("alg='frechet' requires frechet_margin (delta) to be set.")
+     capture_layers = _resolve_capture_layers(
+         model,
+         layer_ratio=layer_ratio,
+@@ -205,14 +262,34 @@ def generate_dapd(
+                 greedy_mask_index = mask_index & ~direct_selected
+                 stats["direct_conf_unmasked_per_step"].append(direct_counts["direct_added"])
+ 
+-            selected = select_independent_set(
+-                confidence=confidence,
+-                dependency_score=dependency_scores,
+-                dependency=dependency,
+-                mask_index=greedy_mask_index,
+-                tau=current_tau,
+-            )
+-            selected = selected | direct_selected
++            if alg == "frechet":
++                # INSERTION: replace the dependency-aware commit decision with
++                # the Frechet-profile rule over the same marginal confidences.
++                # Attention capture + dependency-graph computation above stay
++                # ACTIVE (per-step cost parity with the unmodified pipeline);
++                # the Frechet selector simply does not consume them.
++                # Confidence is recomputed in float64 from the SAME logits at
++                # the SAME argmax predictions, matching the anchor
++                # get_transfer_index_frechet_profile numerics exactly: DAPD's
++                # bf16 softmax saturates high confidences to exactly 1.0,
++                # which makes G_n non-decaying and mass-commits the EOS tail.
++                p64 = F.softmax(logits.to(torch.float64), dim=-1)
++                conf64 = torch.gather(p64, dim=-1, index=predictions.unsqueeze(-1)).squeeze(-1)
++                selected = _compute_frechet_selection(
++                    confidence=conf64,
++                    mask_index=mask_index,
++                    margin=float(frechet_margin),
++                )
++                stats["frechet_committed_per_step"].append(int(selected.sum().item()))
++            else:
++                selected = select_independent_set(
++                    confidence=confidence,
++                    dependency_score=dependency_scores,
++                    dependency=dependency,
++                    mask_index=greedy_mask_index,
++                    tau=current_tau,
++                )
++                selected = selected | direct_selected
+ 
+             if alg == "dapd_staged":
+                 progress = 1.0 - (remaining_masks / gen_length)
+@@ -307,6 +384,11 @@ def generate_dapd_with_blocks(
+     mask_id = int(kwargs.pop("mask_id", 126336))
+     verbose = bool(kwargs.pop("verbose", False))
+     alg = validate_dapd_algorithm(kwargs.pop("alg", "dapd_staged"))
++    if alg == "frechet":
++        raise ValueError(
++            "alg='frechet' (insertion experiment) is only implemented in the "
++            "non-block generate_dapd path (block_length=0 or >= gen_length)."
++        )
+     collect_step_history = bool(kwargs.pop("collect_step_history", True))
+     if kwargs:
+         raise ValueError(f"Unsupported DAPD options in deploy path: {sorted(kwargs)}")
+diff --git a/evaluation/lm-evaluation-harness/lm_eval/models/llada_dapd.py b/evaluation/lm-evaluation-harness/lm_eval/models/llada_dapd.py
+index 4e4f26a..becd9c2 100644
+--- a/evaluation/lm-evaluation-harness/lm_eval/models/llada_dapd.py
++++ b/evaluation/lm-evaluation-harness/lm_eval/models/llada_dapd.py
+@@ -75,6 +75,8 @@ class LLaDAModelDAPD(LM):
+         block_length: int = 0,  # Block length (0 = gen_length, for logging)
+         # Paper-facing DAPD algorithm selector.
+         alg: str = "dapd_staged",
++        # Frechet insertion experiment: safety margin delta (required for alg=frechet)
++        frechet_margin=None,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -102,9 +104,14 @@ class LLaDAModelDAPD(LM):
+         self.block_length = int(block_length) if block_length else 0
+ 
+         self.dapd_algorithm = validate_dapd_algorithm(alg)
++        self.frechet_margin = None if frechet_margin is None else float(frechet_margin)
++        if self.dapd_algorithm == "frechet" and self.frechet_margin is None:
++            raise ValueError("alg='frechet' requires frechet_margin (delta) in model_args.")
+         print(f"Loading LLaDA model: {pretrained}")
+         print("DAPD enabled: True")
+         print(f"  DAPD alg: {self.dapd_algorithm}, tau=[{self.tau_min}, {self.tau_max}]")
++        if self.dapd_algorithm == "frechet":
++            print(f"  Frechet insertion: margin delta={self.frechet_margin}")
+         if summary_file:
+             print(f"Summary will be logged to: {summary_file}")
+ 
+@@ -197,6 +204,7 @@ class LLaDAModelDAPD(LM):
+                 layer_ratio=self.layer_ratio,
+                 mask_id=self.mask_id,
+                 alg=self.dapd_algorithm,
++                frechet_margin=self.frechet_margin,
+                 verbose=False,
+             )
+         
+@@ -273,6 +281,8 @@ class LLaDAModelDAPD(LM):
+                     collect_step_history=False,
+                     verbose=False,
+                 )
++                if self.dapd_algorithm == "frechet":
++                    dapd_kwargs.update(frechet_margin=self.frechet_margin)
+                 if use_blockwise_dapd:
+                     dapd_kwargs.update(block_length=actual_block_length, attention_scope="global")
+ 
+@@ -401,6 +411,7 @@ class LLaDAModelDAPD(LM):
+                 'tau_min': self.tau_min,
+                 'tau_max': self.tau_max,
+                 'alg': self.dapd_algorithm,
++                'frechet_margin': self.frechet_margin,
+                 'latency_definition': 'prompt_tokenization_to_decoded_output_wall_clock',
+                 'cuda_synchronized_timing': True,
+                 'token_per_second_definition': 'num_samples * max_gen_toks / total_time',
