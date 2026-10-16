@@ -26,7 +26,7 @@ All comparisons use our own reproductions of threshold/factor on a single H100.
 | Method | Accuracy | Tok/s | NFE |
 |--------|----------|-------|-----|
 | Threshold=0.9 | 77.6% | 73.8 | 107,135 |
-| Factor=0.75 | 78.1% | 96.0 | 79,047 |
+| Factor=1.0 | 78.1% | 96.0 | 79,047 |
 | **Fréchet d=0.25** | **77.2%** | **103.8** | **72,881** |
 
 ### LLaDA-8B-Instruct, HumanEval 256, Prefix Cache (H100)
@@ -34,7 +34,7 @@ All comparisons use our own reproductions of threshold/factor on a single H100.
 | Method | pass@1 | Tok/s | NFE |
 |--------|--------|-------|-----|
 | Threshold=0.9 | 40.2% | 77.8 | 13,666 |
-| Factor=0.75 | 40.7% | 89.6 | 10,538 |
+| Factor=1.0 | 40.7% | 89.6 | 10,538 |
 | **Fréchet d=0.25** | **40.9%** | **107.7** | **9,740** |
 
 ### LLaDA-8B-Instruct, GSM8K 1024, Dual Cache (H100)
@@ -42,7 +42,7 @@ All comparisons use our own reproductions of threshold/factor on a single H100.
 | Method | Accuracy | Tok/s | NFE |
 |--------|----------|-------|-----|
 | Threshold=0.9 | 77.3% | 34.6 | 33,308 |
-| Factor=0.75 | 76.7% | 39.8 | 26,609 |
+| Factor=1.0 | 76.7% | 39.8 | 26,609 |
 | **Fréchet d=0.25** | **78.0%** | **40.8** | **25,172** |
 
 ## Installation
